@@ -1677,8 +1677,11 @@ def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
 
 
 def create_mm_data_row(
-    text_prompt, images: list, images_base64, output_len, processor, backend
+    text_prompt, images: list, images_base64, output_len, processor, backend,
+    token_ids=None,
 ):
+    tokenizer_to_use = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
     try:
         if type(processor).__name__ == "Phi4MMProcessor":
             # <|endoftext10|> is the image token used in the phi-4-multimodal model.
@@ -1716,32 +1719,26 @@ def create_mm_data_row(
             add_generation_prompt=True,
             tokenize=False,
         )
-        text_prompt_len = processor(
-            text=[text_only_prompt],
-            padding=False,
-            return_tensors="pt",
-        )["input_ids"].numel()
+        text_only_len = len(tokenizer_to_use.encode(text_only_prompt))
     except Exception:
-        # Fallback: just tokenize the text prompt directly
-        tokenizer_to_use = (
-            processor.tokenizer if hasattr(processor, "tokenizer") else processor
-        )
-        text_prompt_len = len(tokenizer_to_use.encode(text_prompt))
+        text_only_len = len(tokenizer_to_use.encode(text_prompt))
 
-    # Vision tokens = total tokens - text tokens
-    vision_prompt_len = prompt_len - text_prompt_len
+    vision_prompt_len = prompt_len - text_only_len
 
-    use_raw_prompt = backend in [
-        "sglang",
-        "sglang-oai",
-        "sglang-oai-chat",
-        "vllm",
-        "vllm-chat",
-        "lmdeploy",
-        "lmdeploy-chat",
-    ]
+    text_prompt_len = len(token_ids) if token_ids is not None else text_only_len
+    if token_ids is not None:
+        prompt_len = text_prompt_len + vision_prompt_len
+
+    _RAW_BACKENDS = {"sglang", "sglang-oai", "sglang-oai-chat", "vllm", "vllm-chat", "lmdeploy", "lmdeploy-chat"}
+    if token_ids is not None and backend == "sglang":
+        prompt = token_ids
+    elif backend in _RAW_BACKENDS:
+        prompt = text_prompt
+    else:
+        prompt = prompt_str
+
     return DatasetRow(
-        prompt=text_prompt if use_raw_prompt else prompt_str,
+        prompt=prompt,
         prompt_len=prompt_len,
         output_len=output_len,
         text_prompt_len=text_prompt_len,
@@ -1831,7 +1828,7 @@ def sample_image_requests(
         request_image_count = int(image_counts[i])
 
         # Generate text prompt
-        text_prompt = gen_mm_prompt(
+        token_ids, text_prompt = gen_mm_prompt(
             processor.tokenizer,
             processor.image_token_id if hasattr(processor, "image_token_id") else None,
             int(input_lens[i]),
@@ -1850,6 +1847,7 @@ def sample_image_requests(
             int(output_lens[i]),
             processor,
             backend,
+            token_ids=token_ids,
         )
         dataset.append(data_row)
 
@@ -1874,7 +1872,8 @@ def sample_image_requests(
 @lru_cache(maxsize=1)
 def get_available_tokens(tokenizer):
     """Get all available token ids from the tokenizer vocabulary."""
-    return list(tokenizer.get_vocab().values())
+    return sorted(tokenizer.get_vocab().values())
+    # return list(tokenizer.get_vocab().values()) # to get reproducible results
 
 
 def gen_prompt(tokenizer, token_num):
@@ -1885,12 +1884,13 @@ def gen_prompt(tokenizer, token_num):
 
 
 def gen_mm_prompt(tokenizer, image_pad_id, token_num):
-    """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    all_available_tokens = list(tokenizer.get_vocab().values())
-    if image_pad_id:
-        all_available_tokens.remove(image_pad_id)
-    selected_tokens = random.choices(all_available_tokens, k=token_num)
-    return tokenizer.decode(selected_tokens)
+    """Generate a random prompt as token IDs, avoiding the image pad token."""
+    all_available_tokens = get_available_tokens(tokenizer)
+    if image_pad_id is not None:
+        all_available_tokens = [t for t in all_available_tokens if t != image_pad_id]
+    token_ids = random.choices(all_available_tokens, k=token_num)
+    text_prompt = tokenizer.decode(token_ids)
+    return token_ids, text_prompt
 
 
 def get_gen_prefix_cache_path(args, tokenizer):
