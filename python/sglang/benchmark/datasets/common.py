@@ -78,9 +78,10 @@ def gen_prompt(tokenizer, token_num):
 
 
 def gen_mm_prompt(tokenizer, image_pad_id, token_num):
-    """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    all_available_tokens = list(tokenizer.get_vocab().values())
-    if image_pad_id:
-        all_available_tokens.remove(image_pad_id)
-    selected_tokens = random.choices(all_available_tokens, k=token_num)
-    return tokenizer.decode(selected_tokens)
+    """Generate a random prompt as token IDs, avoiding the image pad token."""
+    all_available_tokens = get_available_tokens(tokenizer)
+    if image_pad_id is not None:
+        all_available_tokens = [t for t in all_available_tokens if t != image_pad_id]
+    token_ids = random.choices(all_available_tokens, k=token_num)
+    text_prompt = tokenizer.decode(token_ids)
+    return token_ids, text_prompt

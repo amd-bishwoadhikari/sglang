@@ -94,11 +94,28 @@ def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
 
 
 def create_mm_data_row(
-    text_prompt, images: list, images_base64, output_len, processor, backend
+    text_prompt,
+    images: list,
+    images_base64,
+    output_len,
+    processor,
+    backend,
+    target_text_len=None,
 ):
+    # sglang-oai-chat: server applies chat template, so send raw text.
+    # sglang/sglang-native: /generate doesn't apply chat template, so send
+    #   prompt_str with image placeholder tokens for the multimodal processor.
+    supported_backends = ["sglang", "sglang-native", "sglang-oai-chat"]
+    if backend not in supported_backends:
+        raise ValueError(
+            f"Image dataset only supports backends: {supported_backends}, "
+            f"got '{backend}'."
+        )
+
+    use_raw_prompt = backend == "sglang-oai-chat"
+
     try:
         if type(processor).__name__ == "Phi4MMProcessor":
-            # <|endoftext10|> is the image token used in the phi-4-multimodal model.
             content_items = text_prompt.replace("image 1", "|endoftext10|")
         else:
             content_items = [
@@ -117,8 +134,8 @@ def create_mm_data_row(
         # Some tokenizers do not support list content; fall back to a placeholder in the text
         prompt_str = f"<image>{text_prompt}"
 
-    # Calculate total tokens (text + vision)
-    prompt_len = processor(
+    # Total tokens from processor (text + template + vision)
+    total_prompt_len = processor(
         text=[prompt_str],
         images=images,
         padding=False,
@@ -145,20 +162,16 @@ def create_mm_data_row(
         )
         text_prompt_len = len(tokenizer_to_use.encode(text_prompt))
 
-    # Vision tokens = total tokens - text tokens
-    vision_prompt_len = prompt_len - text_prompt_len
+    vision_prompt_len = total_prompt_len - text_prompt_len
 
-    supported_backends = ["sglang", "sglang-native", "sglang-oai-chat"]
-    if backend not in supported_backends:
-        raise ValueError(
-            f"Image dataset only supports backends: {supported_backends}, "
-            f"got '{backend}'."
-        )
-
-    # sglang-oai-chat: server's chat handler applies chat template, so send raw text.
-    # sglang/sglang-native: /generate does not apply chat template, so send prompt_str
-    #         which contains image placeholder tokens needed by the multimodal processor.
-    use_raw_prompt = backend == "sglang-oai-chat"
+    # When target_text_len is provided, use it directly as text_prompt_len
+    # to avoid decode/re-encode round-trip drift and chat template overhead.
+    if target_text_len is not None:
+        text_prompt_len = target_text_len
+        prompt_len = target_text_len + vision_prompt_len
+    else:
+        text_prompt_len = text_prompt_len
+        prompt_len = total_prompt_len
 
     return DatasetRow(
         prompt=text_prompt if use_raw_prompt else prompt_str,
@@ -251,10 +264,11 @@ def sample_image_requests(
         request_image_count = int(image_counts[i])
 
         # Generate text prompt
-        text_prompt = gen_mm_prompt(
+        target_len = int(input_lens[i])
+        token_ids, text_prompt = gen_mm_prompt(
             processor.tokenizer,
             processor.image_token_id if hasattr(processor, "image_token_id") else None,
-            int(input_lens[i]),
+            target_len,
         )
 
         # Generate image list
@@ -270,11 +284,13 @@ def sample_image_requests(
             int(output_lens[i]),
             processor,
             backend,
+            target_text_len=target_len,
         )
         dataset.append(data_row)
 
     # Print statistics
     print(f"#Input tokens: {np.sum([x.prompt_len for x in dataset])}")
+    print(f"#Requested input sequence length: {np.sum([x.text_prompt_len for x in dataset])}")
     print(f"#Output tokens: {np.sum([x.output_len for x in dataset])}")
     print(f"#Total images: {total_images}")
 
