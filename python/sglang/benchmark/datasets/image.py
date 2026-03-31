@@ -100,7 +100,7 @@ def create_mm_data_row(
     output_len,
     processor,
     backend,
-    target_text_len=None,
+    input_text_len=None,
 ):
     # sglang-oai-chat: server applies chat template, so send raw text.
     # sglang/sglang-native: /generate doesn't apply chat template, so send
@@ -116,6 +116,7 @@ def create_mm_data_row(
 
     try:
         if type(processor).__name__ == "Phi4MMProcessor":
+            # <|endoftext10|> is the image token used in the phi-4-multimodal model.
             content_items = text_prompt.replace("image 1", "|endoftext10|")
         else:
             content_items = [
@@ -134,13 +135,15 @@ def create_mm_data_row(
         # Some tokenizers do not support list content; fall back to a placeholder in the text
         prompt_str = f"<image>{text_prompt}"
 
-    # Total tokens from processor (text + template + vision)
-    total_prompt_len = processor(
+    # Calculate total tokens (text + vision)
+    processed = processor(
         text=[prompt_str],
         images=images,
         padding=False,
         return_tensors="pt",
-    )["input_ids"].numel()
+    )
+    input_ids = processed["input_ids"][0]
+    prompt_len = input_ids.numel()
 
     # Calculate text-only tokens
     try:
@@ -155,6 +158,7 @@ def create_mm_data_row(
             padding=False,
             return_tensors="pt",
         )["input_ids"].numel()
+
     except Exception:
         # Fallback: just tokenize the text prompt directly
         tokenizer_to_use = (
@@ -162,16 +166,19 @@ def create_mm_data_row(
         )
         text_prompt_len = len(tokenizer_to_use.encode(text_prompt))
 
-    vision_prompt_len = total_prompt_len - text_prompt_len
-
-    # When target_text_len is provided, use it directly as text_prompt_len
-    # to avoid decode/re-encode round-trip drift and chat template overhead.
-    if target_text_len is not None:
-        text_prompt_len = target_text_len
-        prompt_len = target_text_len + vision_prompt_len
+    # Count vision tokens directly via image_token_id if available
+    if hasattr(processor, "image_token_id") and processor.image_token_id is not None:
+        vision_prompt_len = (input_ids == processor.image_token_id).sum().item()
+    # Indirect vision prompt length calculation: total prompt len - text only prompt len
+    # This will add extra tokens for chat template (e.g. <|vision_start|> and <|vision_end|>)
     else:
-        text_prompt_len = text_prompt_len
-        prompt_len = total_prompt_len
+        vision_prompt_len = prompt_len - text_prompt_len
+
+    # When input_text_len is provided, use it directly as text_prompt_len
+    # to avoid decode/re-encode round-trip drift and chat template overhead.
+    if input_text_len is not None:
+        text_prompt_len = input_text_len
+        prompt_len = text_prompt_len + vision_prompt_len
 
     return DatasetRow(
         prompt=text_prompt if use_raw_prompt else prompt_str,
@@ -265,7 +272,7 @@ def sample_image_requests(
 
         # Generate text prompt
         target_len = int(input_lens[i])
-        token_ids, text_prompt = gen_mm_prompt(
+        text_prompt = gen_mm_prompt(
             processor.tokenizer,
             processor.image_token_id if hasattr(processor, "image_token_id") else None,
             target_len,
@@ -284,13 +291,15 @@ def sample_image_requests(
             int(output_lens[i]),
             processor,
             backend,
-            target_text_len=target_len,
+            input_text_len=target_len,
         )
         dataset.append(data_row)
 
     # Print statistics
-    print(f"#Input tokens: {np.sum([x.prompt_len for x in dataset])}")
-    print(f"#Requested input sequence length: {np.sum([x.text_prompt_len for x in dataset])}")
+    print(f"#Input tokens: {np.sum([x.text_prompt_len for x in dataset])}")
+    print(
+        f"#Total Input tokens: {np.sum([x.prompt_len for x in dataset])} (input + vision)"
+    )
     print(f"#Output tokens: {np.sum([x.output_len for x in dataset])}")
     print(f"#Total images: {total_images}")
 

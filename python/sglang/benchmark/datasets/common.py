@@ -84,4 +84,4 @@ def gen_mm_prompt(tokenizer, image_pad_id, token_num):
         all_available_tokens = [t for t in all_available_tokens if t != image_pad_id]
     token_ids = random.choices(all_available_tokens, k=token_num)
     text_prompt = tokenizer.decode(token_ids)
-    return token_ids, text_prompt
+    return text_prompt
