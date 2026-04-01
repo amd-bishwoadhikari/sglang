@@ -139,6 +139,7 @@ def _count_total_prompt_tokens(
     processor: AutoProcessor,
     prompt_str: str,
     images: List[Image.Image],
+    return_input_ids: bool = False,
 ):
     processed = processor(
         text=[prompt_str],
@@ -147,7 +148,10 @@ def _count_total_prompt_tokens(
         return_tensors="pt",
     )
     input_ids = processed["input_ids"][0]
-    return input_ids, input_ids.numel()
+    count = input_ids.numel()
+    if return_input_ids:
+        return input_ids, count
+    return count
 
 
 def _count_text_prompt_tokens(processor: AutoProcessor, text_prompt: str) -> int:
@@ -189,7 +193,9 @@ def create_mm_data_row(
     use_raw_prompt: bool,
 ) -> DatasetRow:
     prompt_str = _build_mm_prompt_str(processor, text_prompt, images_base64)
-    input_ids, prompt_len = _count_total_prompt_tokens(processor, prompt_str, images)
+    input_ids, prompt_len = _count_total_prompt_tokens(
+        processor, prompt_str, images, return_input_ids=True
+    )
     text_prompt_len = _count_text_prompt_tokens(processor, text_prompt)
     raw_vision_prompt_len = _count_raw_vision_tokens(input_ids, processor)
     vision_prompt_len = prompt_len - text_prompt_len
