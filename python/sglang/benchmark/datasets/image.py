@@ -97,10 +97,10 @@ def create_mm_data_row(
     text_prompt: str,
     images: List[Image.Image],
     images_base64: List[str],
+    input_len: int,
     output_len: int,
     processor: AutoProcessor,
     backend: str,
-    input_len: int,
 ) -> DatasetRow:
     # sglang-oai-chat: server applies chat template, so send raw text.
     # sglang/sglang-native: /generate doesn't apply chat template, so send
@@ -173,8 +173,8 @@ def create_mm_data_row(
     return DatasetRow(
         prompt=text_prompt if use_raw_prompt else prompt_str,
         prompt_len=prompt_len,
-        output_len=output_len,
         input_len=input_len,
+        output_len=output_len,
         text_prompt_len=text_prompt_len,
         vision_prompt_len=vision_prompt_len,
         raw_vision_prompt_len=raw_vision_prompt_len,
@@ -324,11 +324,12 @@ def sample_image_requests(
         request_image_count = int(image_counts[i])
 
         # Generate text prompt
-        target_len = int(input_lens[i])
+        target_input_len = int(input_lens[i])
+        target_output_len = int(output_lens[i])
         text_prompt = gen_mm_prompt(
             processor.tokenizer,
             processor.image_token_id if hasattr(processor, "image_token_id") else None,
-            target_len,
+            target_input_len,
         )
 
         # Generate image list
@@ -341,10 +342,10 @@ def sample_image_requests(
             text_prompt,
             list(images),
             list(images_base64),
-            int(output_lens[i]),
+            target_input_len,
+            target_output_len,
             processor,
             backend,
-            input_len=target_len,
         )
         dataset.append(data_row)
 
