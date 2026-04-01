@@ -93,27 +93,26 @@ def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
     )
 
 
-def create_mm_data_row(
-    text_prompt: str,
-    images: List[Image.Image],
-    images_base64: List[str],
-    input_len: int,
-    output_len: int,
-    processor: AutoProcessor,
-    backend: str,
-) -> DatasetRow:
+_SUPPORTED_BACKENDS = {"sglang", "sglang-native", "sglang-oai-chat"}
+
+
+def _resolve_prompt_mode(backend: str) -> bool:
+    if backend not in _SUPPORTED_BACKENDS:
+        raise ValueError(
+            f"Image dataset only supports backends: {sorted(_SUPPORTED_BACKENDS)}, "
+            f"got '{backend}'."
+        )
     # sglang-oai-chat: server applies chat template, so send raw text.
     # sglang/sglang-native: /generate doesn't apply chat template, so send
     #   prompt_str with image placeholder tokens for the multimodal processor.
-    supported_backends = ["sglang", "sglang-native", "sglang-oai-chat"]
-    if backend not in supported_backends:
-        raise ValueError(
-            f"Image dataset only supports backends: {supported_backends}, "
-            f"got '{backend}'."
-        )
+    return backend == "sglang-oai-chat"
 
-    use_raw_prompt = backend == "sglang-oai-chat"
 
+def _build_mm_prompt_str(
+    processor: AutoProcessor,
+    text_prompt: str,
+    images_base64: List[str],
+) -> str:
     try:
         if type(processor).__name__ == "Phi4MMProcessor":
             # <|endoftext10|> is the image token used in the phi-4-multimodal model.
@@ -124,7 +123,7 @@ def create_mm_data_row(
                 for image_base64 in images_base64
             ]
             content_items.append({"type": "text", "text": text_prompt})
-        prompt_str = processor.apply_chat_template(
+        return processor.apply_chat_template(
             [{"role": "user", "content": content_items}],
             add_generation_prompt=True,
             tokenize=False,
@@ -133,9 +132,14 @@ def create_mm_data_row(
         # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
         print(f"Error applying chat template: {e}, fallback to <image> tag")
         # Some tokenizers do not support list content; fall back to a placeholder in the text
-        prompt_str = f"<image>{text_prompt}"
+        return f"<image>{text_prompt}"
 
-    # Total sequence length (text + vision + templates + overheads)
+
+def _count_total_prompt_tokens(
+    processor: AutoProcessor,
+    prompt_str: str,
+    images: List[Image.Image],
+):
     processed = processor(
         text=[prompt_str],
         images=images,
@@ -143,8 +147,10 @@ def create_mm_data_row(
         return_tensors="pt",
     )
     input_ids = processed["input_ids"][0]
-    prompt_len = input_ids.numel()
+    return input_ids, input_ids.numel()
 
+
+def _count_text_prompt_tokens(processor: AutoProcessor, text_prompt: str) -> int:
     # Text tokens after chat template (no images)
     try:
         text_only_str = processor.apply_chat_template(
@@ -152,7 +158,8 @@ def create_mm_data_row(
             add_generation_prompt=True,
             tokenize=False,
         )
-        text_prompt_len = processor(
+        # text prompt length with chat template
+        return processor(
             text=[text_only_str],
             padding=False,
             return_tensors="pt",
@@ -161,13 +168,30 @@ def create_mm_data_row(
         tokenizer_to_use = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
-        text_prompt_len = len(tokenizer_to_use.encode(text_prompt))
+        # text prompt length without chat template
+        return len(tokenizer_to_use.encode(text_prompt))
 
-    # Raw vision tokens (image pad tokens only)
-    if hasattr(processor, "image_token_id") and processor.image_token_id is not None:
-        raw_vision_prompt_len = (input_ids == processor.image_token_id).sum().item()
-    else:
-        raw_vision_prompt_len = 0
+
+def _count_raw_vision_tokens(input_ids, processor: AutoProcessor) -> int:
+    image_token_id = getattr(processor, "image_token_id", None)
+    if image_token_id is None:
+        return 0
+    return (input_ids == image_token_id).sum().item()
+
+
+def create_mm_data_row(
+    text_prompt: str,
+    images: List[Image.Image],
+    images_base64: List[str],
+    input_len: int,
+    output_len: int,
+    processor: AutoProcessor,
+    use_raw_prompt: bool,
+) -> DatasetRow:
+    prompt_str = _build_mm_prompt_str(processor, text_prompt, images_base64)
+    input_ids, prompt_len = _count_total_prompt_tokens(processor, prompt_str, images)
+    text_prompt_len = _count_text_prompt_tokens(processor, text_prompt)
+    raw_vision_prompt_len = _count_raw_vision_tokens(input_ids, processor)
     vision_prompt_len = prompt_len - text_prompt_len
 
     return DatasetRow(
@@ -193,14 +217,13 @@ def _print_image_stats(
     image_content,
     image_format,
     total_image_bytes,
-    num_requests,
 ):
     _ROWS = [
-        ("Raw text prompt tokens (w\\o overhead)", "input_len"),
-        ("Text prompt tokens (w\\ overhead)", "text_prompt_len"),
+        ("Raw text prompt tokens (w/o overhead)", "input_len"),
+        ("Text prompt tokens (w overhead)", "text_prompt_len"),
         ("Text prompt overhead", "text_prompt_overhead"),
-        ("Raw vision prompt tokens (w\\o overhead)", "raw_vision_prompt_len"),
-        ("Vision prompt tokens (w\\ overhead)", "vision_prompt_len"),
+        ("Raw vision prompt tokens (w/o overhead)", "raw_vision_prompt_len"),
+        ("Vision prompt tokens (w overhead)", "vision_prompt_len"),
         ("Vision overhead", "vision_prompt_overhead"),
         ("Total input tokens", "prompt_len"),
         ("Total output tokens", "output_len"),
@@ -237,9 +260,9 @@ def _print_image_stats(
         )
     print(
         f"\n  Image payload: {image_content} {image_format}, "
-        f"avg {total_image_bytes // num_requests:,} bytes/request"
+        f"avg {total_image_bytes // len(dataset):,} bytes/request"
     )
-    print("====================================\n")
+    print("====================================")
 
 
 def sample_image_requests(
@@ -265,6 +288,8 @@ def sample_image_requests(
       the 'random' dataset sampling rule.  ``DatasetRow.prompt_len`` is the
       full sequence length (text + vision + templates + overheads).
     """
+
+    use_raw_prompt = _resolve_prompt_mode(backend)
 
     # Parse resolution (supports presets and 'heightxwidth')
     width, height = parse_image_resolution(image_resolution)
@@ -328,7 +353,7 @@ def sample_image_requests(
         target_output_len = int(output_lens[i])
         text_prompt = gen_mm_prompt(
             processor.tokenizer,
-            processor.image_token_id if hasattr(processor, "image_token_id") else None,
+            getattr(processor, "image_token_id", None),
             target_input_len,
         )
 
@@ -345,7 +370,7 @@ def sample_image_requests(
             target_input_len,
             target_output_len,
             processor,
-            backend,
+            use_raw_prompt,
         )
         dataset.append(data_row)
 
@@ -359,6 +384,5 @@ def sample_image_requests(
         image_content,
         image_format,
         total_image_bytes,
-        num_requests,
     )
     return dataset
