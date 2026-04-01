@@ -86,6 +86,15 @@ def sample_mmmu_requests(
 
     # Create prompts
     filtered_dataset = []
+    supported_backends = {"sglang", "sglang-native", "sglang-oai-chat"}
+    if backend not in supported_backends:
+        raise ValueError(
+            f"MMMU dataset only supports backends: {sorted(supported_backends)}, got '{backend}'."
+        )
+    use_raw_prompt = backend == "sglang-oai-chat"
+    tokenizer_to_use = (
+        processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    )
 
     for i, example in enumerate(sample_dataset):
         try:
@@ -111,9 +120,16 @@ def sample_mmmu_requests(
 
                 # Construct the prompt
                 text_prompt = f"Question: {question}\n\nAnswer: "
+                input_len = len(tokenizer_to_use.encode(text_prompt))
                 output_len = fixed_output_len if fixed_output_len is not None else 256
                 data_row = create_mm_data_row(
-                    text_prompt, [image], [image_data], output_len, processor, backend
+                    text_prompt,
+                    [image],
+                    [image_data],
+                    input_len,
+                    output_len,
+                    processor,
+                    use_raw_prompt,
                 )
                 filtered_dataset.append(data_row)
 
