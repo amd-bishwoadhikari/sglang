@@ -23,18 +23,30 @@ class DatasetRow:
     prompt: Any
     prompt_len: int
     output_len: int
+    input_len: Optional[int] = None
     text_prompt_len: Optional[int] = None
     vision_prompt_len: Optional[int] = None
     image_data: Optional[List[str]] = None
+    raw_vision_prompt_len: Optional[int] = None
+    text_prompt_overhead: Optional[int] = None
+    vision_prompt_overhead: Optional[int] = None
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
     extra_request_body: Optional[Dict[str, Any]] = None  # Per-request API parameters
 
     def __post_init__(self):
+        if self.input_len is None:
+            self.input_len = self.prompt_len
         if self.text_prompt_len is None:
             self.text_prompt_len = self.prompt_len
         if self.vision_prompt_len is None:
             self.vision_prompt_len = 0
+        if self.raw_vision_prompt_len is None:
+            self.raw_vision_prompt_len = 0
+        if self.text_prompt_overhead is None:
+            self.text_prompt_overhead = 0
+        if self.vision_prompt_overhead is None:
+            self.vision_prompt_overhead = 0
         if self.extra_request_body is None:
             self.extra_request_body = {}
 
