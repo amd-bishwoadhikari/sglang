@@ -94,14 +94,14 @@ def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
 
 
 def create_mm_data_row(
-    text_prompt,
-    images: list,
-    images_base64,
-    output_len,
-    processor,
-    backend,
-    input_text_len=None,
-):
+    text_prompt: str,
+    images: List[Image.Image],
+    images_base64: List[str],
+    output_len: int,
+    processor: AutoProcessor,
+    backend: str,
+    input_len: int,
+) -> DatasetRow:
     # sglang-oai-chat: server applies chat template, so send raw text.
     # sglang/sglang-native: /generate doesn't apply chat template, so send
     #   prompt_str with image placeholder tokens for the multimodal processor.
@@ -135,7 +135,7 @@ def create_mm_data_row(
         # Some tokenizers do not support list content; fall back to a placeholder in the text
         prompt_str = f"<image>{text_prompt}"
 
-    # Calculate total tokens (text + vision)
+    # Total sequence length (text + vision + templates + overheads)
     processed = processor(
         text=[prompt_str],
         images=images,
@@ -145,49 +145,80 @@ def create_mm_data_row(
     input_ids = processed["input_ids"][0]
     prompt_len = input_ids.numel()
 
-    # Calculate text-only tokens
+    # Text tokens after chat template (no images)
     try:
-        # Create text-only version of the prompt
-        text_only_prompt = processor.apply_chat_template(
+        text_only_str = processor.apply_chat_template(
             [{"role": "user", "content": text_prompt}],
             add_generation_prompt=True,
             tokenize=False,
         )
         text_prompt_len = processor(
-            text=[text_only_prompt],
+            text=[text_only_str],
             padding=False,
             return_tensors="pt",
         )["input_ids"].numel()
-
     except Exception:
-        # Fallback: just tokenize the text prompt directly
         tokenizer_to_use = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
         text_prompt_len = len(tokenizer_to_use.encode(text_prompt))
 
-    # Count vision tokens directly via image_token_id if available
+    # Raw vision tokens (image pad tokens only)
     if hasattr(processor, "image_token_id") and processor.image_token_id is not None:
-        vision_prompt_len = (input_ids == processor.image_token_id).sum().item()
-    # Indirect vision prompt length calculation: total prompt len - text only prompt len
-    # This will add extra tokens for chat template (e.g. <|vision_start|> and <|vision_end|>)
+        raw_vision_prompt_len = (input_ids == processor.image_token_id).sum().item()
     else:
-        vision_prompt_len = prompt_len - text_prompt_len
-
-    # When input_text_len is provided, use it directly as text_prompt_len
-    # to avoid decode/re-encode round-trip drift and chat template overhead.
-    if input_text_len is not None:
-        text_prompt_len = input_text_len
-        prompt_len = text_prompt_len + vision_prompt_len
+        raw_vision_prompt_len = 0
+    vision_prompt_len = prompt_len - text_prompt_len
 
     return DatasetRow(
         prompt=text_prompt if use_raw_prompt else prompt_str,
         prompt_len=prompt_len,
         output_len=output_len,
+        input_len=input_len,
         text_prompt_len=text_prompt_len,
         vision_prompt_len=vision_prompt_len,
+        raw_vision_prompt_len=raw_vision_prompt_len,
+        text_prompt_overhead=prompt_len - input_len - vision_prompt_len,
+        vision_prompt_overhead=vision_prompt_len - raw_vision_prompt_len,
         image_data=images_base64,
     )
+
+
+def _print_image_stats(dataset, total_images, image_counts, random_image_count,
+                       image_count, image_content, image_format,
+                       total_image_bytes, num_requests):
+    _ROWS = [
+        ("Raw text prompt tokens (w\\o overhead)", "input_len"),
+        ("Text prompt tokens (w\\ overhead)", "text_prompt_len"),
+        ("Text prompt overhead", "text_prompt_overhead"),
+        ("Raw vision prompt tokens (w\\o overhead)", "raw_vision_prompt_len"),
+        ("Vision prompt tokens (w\\ overhead)", "vision_prompt_len"),
+        ("Vision overhead", "vision_prompt_overhead"),
+        ("Total input tokens", "prompt_len"),
+        ("Total output tokens", "output_len"),
+    ]
+    fmt = []
+    for lb, attr in _ROWS:
+        a = np.array([getattr(r, attr) for r in dataset])
+        fmt.append((lb, f"{int(a.sum()):,}", f"{a.mean():,.1f}",
+                    f"{int(a.min()):,}", f"{int(a.max()):,}"))
+    w = [max(len(r[i]) for r in fmt) for i in range(5)]
+
+    print("\n===== Image Dataset Statistics =====")
+    print(f"  Number of requests: {len(dataset)}")
+    print(f"  Total images:       {total_images}")
+    if random_image_count:
+        print(f"  Images per request: min={np.min(image_counts)}, "
+              f"max={np.max(image_counts)}, mean={np.mean(image_counts):.2f}")
+    else:
+        print(f"  Images per request: {image_count} (fixed)")
+    print()
+    for lb, s, m, mn, mx in fmt:
+        print(f"  {lb:<{w[0]}s}  sum={s:>{w[1]}}  mean={m:>{w[2]}}"
+              f"  min={mn:>{w[3]}}  max={mx:>{w[4]}}")
+    print(f"\n  Image payload: {image_content} {image_format}, "
+          f"avg {total_image_bytes // num_requests:,} bytes/request")
+    print("====================================\n")
 
 
 def sample_image_requests(
@@ -209,8 +240,9 @@ def sample_image_requests(
     - If ``random_image_count`` is False, each request includes exactly ``image_count`` images.
     - Supported resolutions: 4k (3840x2160), 1080p (1920x1080), 720p (1280x720), 360p (640x360),
       or custom 'heightxwidth' (e.g., 1080x1920).
-    - Text lengths follow the 'random' dataset sampling rule. ``prompt_len``
-      only counts text tokens and excludes image data.
+    - ``input_len`` / ``output_len`` specify raw text token counts and follow
+      the 'random' dataset sampling rule.  ``DatasetRow.prompt_len`` is the
+      full sequence length (text + vision + templates + overheads).
     """
 
     # Parse resolution (supports presets and 'heightxwidth')
@@ -291,26 +323,20 @@ def sample_image_requests(
             int(output_lens[i]),
             processor,
             backend,
-            input_text_len=target_len,
+            input_len=target_len,
         )
         dataset.append(data_row)
 
     # Print statistics
-    print(f"#Input tokens: {np.sum([x.text_prompt_len for x in dataset])}")
-    print(
-        f"#Total Input tokens: {np.sum([x.prompt_len for x in dataset])} (input + vision)"
-    )
-    print(f"#Output tokens: {np.sum([x.output_len for x in dataset])}")
-    print(f"#Total images: {total_images}")
-
-    if random_image_count:
-        print(
-            f"#Images per request: min={np.min(image_counts)}, max={np.max(image_counts)}, mean={np.mean(image_counts):.2f}"
-        )
-    else:
-        print(f"#Images per request: {image_count} (fixed)")
-
-    print(
-        f"\nCreated {len(dataset)} {image_content} {image_format} images with average {total_image_bytes // num_requests} bytes per request"
+    _print_image_stats(
+        dataset,
+        total_images,
+        image_counts,
+        random_image_count,
+        image_count,
+        image_content,
+        image_format,
+        total_image_bytes,
+        num_requests,
     )
     return dataset
