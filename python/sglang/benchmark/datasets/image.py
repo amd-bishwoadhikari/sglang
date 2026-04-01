@@ -184,9 +184,17 @@ def create_mm_data_row(
     )
 
 
-def _print_image_stats(dataset, total_images, image_counts, random_image_count,
-                       image_count, image_content, image_format,
-                       total_image_bytes, num_requests):
+def _print_image_stats(
+    dataset,
+    total_images,
+    image_counts,
+    random_image_count,
+    image_count,
+    image_content,
+    image_format,
+    total_image_bytes,
+    num_requests,
+):
     _ROWS = [
         ("Raw text prompt tokens (w\\o overhead)", "input_len"),
         ("Text prompt tokens (w\\ overhead)", "text_prompt_len"),
@@ -200,24 +208,37 @@ def _print_image_stats(dataset, total_images, image_counts, random_image_count,
     fmt = []
     for lb, attr in _ROWS:
         a = np.array([getattr(r, attr) for r in dataset])
-        fmt.append((lb, f"{int(a.sum()):,}", f"{a.mean():,.1f}",
-                    f"{int(a.min()):,}", f"{int(a.max()):,}"))
+        fmt.append(
+            (
+                lb,
+                f"{int(a.sum()):,}",
+                f"{a.mean():,.1f}",
+                f"{int(a.min()):,}",
+                f"{int(a.max()):,}",
+            )
+        )
     w = [max(len(r[i]) for r in fmt) for i in range(5)]
 
     print("\n===== Image Dataset Statistics =====")
     print(f"  Number of requests: {len(dataset)}")
     print(f"  Total images:       {total_images}")
     if random_image_count:
-        print(f"  Images per request: min={np.min(image_counts)}, "
-              f"max={np.max(image_counts)}, mean={np.mean(image_counts):.2f}")
+        print(
+            f"  Images per request: min={np.min(image_counts)}, "
+            f"max={np.max(image_counts)}, mean={np.mean(image_counts):.2f}"
+        )
     else:
         print(f"  Images per request: {image_count} (fixed)")
     print()
     for lb, s, m, mn, mx in fmt:
-        print(f"  {lb:<{w[0]}s}  sum={s:>{w[1]}}  mean={m:>{w[2]}}"
-              f"  min={mn:>{w[3]}}  max={mx:>{w[4]}}")
-    print(f"\n  Image payload: {image_content} {image_format}, "
-          f"avg {total_image_bytes // num_requests:,} bytes/request")
+        print(
+            f"  {lb:<{w[0]}s}  sum={s:>{w[1]}}  mean={m:>{w[2]}}"
+            f"  min={mn:>{w[3]}}  max={mx:>{w[4]}}"
+        )
+    print(
+        f"\n  Image payload: {image_content} {image_format}, "
+        f"avg {total_image_bytes // num_requests:,} bytes/request"
+    )
     print("====================================\n")
 
 
