@@ -93,19 +93,72 @@ def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
     )
 
 
-_SUPPORTED_BACKENDS = {"sglang", "sglang-native", "sglang-oai-chat"}
+_SUPPORTED_BACKENDS = ("sglang", "sglang-native", "sglang-oai-chat")
 
 
 def _resolve_prompt_mode(backend: str) -> bool:
     if backend not in _SUPPORTED_BACKENDS:
         raise ValueError(
-            f"Image dataset only supports backends: {sorted(_SUPPORTED_BACKENDS)}, "
+            f"Image dataset only supports backends: {list(_SUPPORTED_BACKENDS)}, "
             f"got '{backend}'."
         )
-    # sglang-oai-chat: server applies chat template, so send raw text.
-    # sglang/sglang-native: /generate doesn't apply chat template, so send
-    #   prompt_str with image placeholder tokens for the multimodal processor.
+
+    # sglang-oai-chat: server's chat handler applies chat template, so send raw text.
+    # sglang/sglang-native: /generate does not apply chat template, so send prompt_str
+    #     which contains image placeholder tokens needed by the multimodal processor.
     return backend == "sglang-oai-chat"
+
+
+def _get_row_metric(row: DatasetRow, attr: str) -> int:
+    def _safe_int(value, default: int = 0) -> int:
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    # Prefer direct DatasetRow attributes when present.
+    direct_value = getattr(row, attr, None)
+    if direct_value is not None:
+        return _safe_int(direct_value)
+
+    # Then prefer metrics stashed in extra_request_body by image dataset.
+    extra_body = getattr(row, "extra_request_body", {}) or {}
+    image_metrics = (
+        extra_body.get("image_metrics", {}) if isinstance(extra_body, dict) else {}
+    )
+    if isinstance(image_metrics, dict) and attr in image_metrics:
+        return _safe_int(image_metrics[attr])
+
+    # Backward-compatible derived values for older DatasetRow schemas.
+    prompt_len = _safe_int(getattr(row, "prompt_len", 0))
+    output_len = _safe_int(getattr(row, "output_len", 0))
+    text_prompt_len = _safe_int(getattr(row, "text_prompt_len", prompt_len), prompt_len)
+    vision_prompt_len = _safe_int(getattr(row, "vision_prompt_len", 0))
+
+    input_len = _safe_int(image_metrics.get("input_len"), text_prompt_len)
+    raw_vision_prompt_len = _safe_int(image_metrics.get("raw_vision_prompt_len"), 0)
+    text_prompt_overhead = _safe_int(
+        image_metrics.get("text_prompt_overhead"),
+        prompt_len - input_len - vision_prompt_len,
+    )
+    vision_prompt_overhead = _safe_int(
+        image_metrics.get("vision_prompt_overhead"),
+        max(vision_prompt_len - raw_vision_prompt_len, 0),
+    )
+
+    metric_map = {
+        "input_len": input_len,
+        "text_prompt_len": text_prompt_len,
+        "vision_prompt_len": vision_prompt_len,
+        "raw_vision_prompt_len": raw_vision_prompt_len,
+        "text_prompt_overhead": text_prompt_overhead,
+        "vision_prompt_overhead": vision_prompt_overhead,
+        "prompt_len": prompt_len,
+        "output_len": output_len,
+    }
+    return metric_map.get(attr, 0)
 
 
 def _build_mm_prompt_str(
@@ -135,25 +188,6 @@ def _build_mm_prompt_str(
         return f"<image>{text_prompt}"
 
 
-def _count_total_prompt_tokens(
-    processor: AutoProcessor,
-    prompt_str: str,
-    images: List[Image.Image],
-    return_input_ids: bool = False,
-):
-    processed = processor(
-        text=[prompt_str],
-        images=images,
-        padding=False,
-        return_tensors="pt",
-    )
-    input_ids = processed["input_ids"][0]
-    count = input_ids.numel()
-    if return_input_ids:
-        return input_ids, count
-    return count
-
-
 def _count_text_prompt_tokens(processor: AutoProcessor, text_prompt: str) -> int:
     # Text tokens after chat template (no images)
     try:
@@ -176,41 +210,72 @@ def _count_text_prompt_tokens(processor: AutoProcessor, text_prompt: str) -> int
         return len(tokenizer_to_use.encode(text_prompt))
 
 
-def _count_raw_vision_tokens(input_ids, processor: AutoProcessor) -> int:
-    image_token_id = getattr(processor, "image_token_id", None)
-    if image_token_id is None:
-        return 0
-    return (input_ids == image_token_id).sum().item()
-
-
 def create_mm_data_row(
     text_prompt: str,
     images: List[Image.Image],
     images_base64: List[str],
-    input_len: int,
-    output_len: int,
-    processor: AutoProcessor,
-    use_raw_prompt: bool,
+    input_len_or_output_len: int,
+    output_len_or_processor,
+    processor_or_backend=None,
+    use_raw_prompt: bool | None = None,
 ) -> DatasetRow:
+    """Build a multimodal DatasetRow.
+
+    Supports both signatures for compatibility:
+    - New: (text_prompt, images, images_base64, input_len, output_len, processor, use_raw_prompt)
+    - Old: (text_prompt, images, images_base64, output_len, processor, backend)
+    """
+    text_prompt_len = None
+    if isinstance(output_len_or_processor, int):
+        input_len = int(input_len_or_output_len)
+        output_len = int(output_len_or_processor)
+        processor = processor_or_backend
+        if use_raw_prompt is None:
+            raise ValueError(
+                "use_raw_prompt must be provided when using the new create_mm_data_row signature."
+            )
+    else:
+        # Backward-compatible path used by mmmu.py.
+        output_len = int(input_len_or_output_len)
+        processor = output_len_or_processor
+        backend = processor_or_backend
+        use_raw_prompt = _resolve_prompt_mode(backend)
+        # Legacy callers do not pass raw input token length; use text prompt
+        # token count as the closest equivalent.
+        text_prompt_len = _count_text_prompt_tokens(processor, text_prompt)
+        input_len = text_prompt_len
+
     prompt_str = _build_mm_prompt_str(processor, text_prompt, images_base64)
-    input_ids, prompt_len = _count_total_prompt_tokens(
-        processor, prompt_str, images, return_input_ids=True
+    input_ids = processor(
+        text=[prompt_str],
+        images=images,
+        padding=False,
+        return_tensors="pt",
+    )["input_ids"][0]
+    prompt_len = input_ids.numel()
+    if text_prompt_len is None:
+        text_prompt_len = _count_text_prompt_tokens(processor, text_prompt)
+    image_token_id = getattr(processor, "image_token_id", None)
+    raw_vision_prompt_len = (
+        (input_ids == image_token_id).sum().item() if image_token_id is not None else 0
     )
-    text_prompt_len = _count_text_prompt_tokens(processor, text_prompt)
-    raw_vision_prompt_len = _count_raw_vision_tokens(input_ids, processor)
     vision_prompt_len = prompt_len - text_prompt_len
 
     return DatasetRow(
         prompt=text_prompt if use_raw_prompt else prompt_str,
         prompt_len=prompt_len,
-        input_len=input_len,
         output_len=output_len,
         text_prompt_len=text_prompt_len,
         vision_prompt_len=vision_prompt_len,
-        raw_vision_prompt_len=raw_vision_prompt_len,
-        text_prompt_overhead=prompt_len - input_len - vision_prompt_len,
-        vision_prompt_overhead=vision_prompt_len - raw_vision_prompt_len,
         image_data=images_base64,
+        extra_request_body={
+            "image_metrics": {
+                "input_len": input_len,
+                "raw_vision_prompt_len": raw_vision_prompt_len,
+                "text_prompt_overhead": prompt_len - input_len - vision_prompt_len,
+                "vision_prompt_overhead": vision_prompt_len - raw_vision_prompt_len,
+            }
+        },
     )
 
 
@@ -236,7 +301,7 @@ def _print_image_stats(
     ]
     fmt = []
     for lb, attr in _ROWS:
-        a = np.array([getattr(r, attr) for r in dataset])
+        a = np.array([_get_row_metric(r, attr) for r in dataset], dtype=np.int64)
         fmt.append(
             (
                 lb,
@@ -266,7 +331,7 @@ def _print_image_stats(
         )
     print(
         f"\n  Image payload: {image_content} {image_format}, "
-        f"avg {total_image_bytes // len(dataset):,} bytes/request"
+        f"avg {total_image_bytes // max(len(dataset), 1):,} bytes/request"
     )
     print("====================================")
 
@@ -290,9 +355,8 @@ def sample_image_requests(
     - If ``random_image_count`` is False, each request includes exactly ``image_count`` images.
     - Supported resolutions: 4k (3840x2160), 1080p (1920x1080), 720p (1280x720), 360p (640x360),
       or custom 'heightxwidth' (e.g., 1080x1920).
-    - ``input_len`` / ``output_len`` specify raw text token counts and follow
-      the 'random' dataset sampling rule.  ``DatasetRow.prompt_len`` is the
-      full sequence length (text + vision + templates + overheads).
+    - Text lengths follow the 'random' dataset sampling rule. ``prompt_len``
+      only counts text tokens and excludes image data.
     """
 
     use_raw_prompt = _resolve_prompt_mode(backend)
