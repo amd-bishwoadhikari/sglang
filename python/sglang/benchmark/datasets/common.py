@@ -23,30 +23,18 @@ class DatasetRow:
     prompt: Any
     prompt_len: int
     output_len: int
-    input_len: Optional[int] = None
     text_prompt_len: Optional[int] = None
     vision_prompt_len: Optional[int] = None
     image_data: Optional[List[str]] = None
-    raw_vision_prompt_len: Optional[int] = None
-    text_prompt_overhead: Optional[int] = None
-    vision_prompt_overhead: Optional[int] = None
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
     extra_request_body: Optional[Dict[str, Any]] = None  # Per-request API parameters
 
     def __post_init__(self):
-        if self.input_len is None:
-            self.input_len = self.prompt_len
         if self.text_prompt_len is None:
             self.text_prompt_len = self.prompt_len
         if self.vision_prompt_len is None:
             self.vision_prompt_len = 0
-        if self.raw_vision_prompt_len is None:
-            self.raw_vision_prompt_len = 0
-        if self.text_prompt_overhead is None:
-            self.text_prompt_overhead = 0
-        if self.vision_prompt_overhead is None:
-            self.vision_prompt_overhead = 0
         if self.extra_request_body is None:
             self.extra_request_body = {}
 
@@ -77,28 +65,22 @@ def compute_random_lens(full_len: int, range_ratio: float, num: int) -> List[int
 
 
 @lru_cache(maxsize=1)
-def get_available_tokens(tokenizer) -> List[int]:
+def get_available_tokens(tokenizer):
     """Get all available token ids from the tokenizer vocabulary."""
     return list(tokenizer.get_vocab().values())
 
 
-@lru_cache(maxsize=1)
-def _get_available_tokens_excluding(tokenizer, exclude_token_id) -> List[int]:
-    """Get available token ids with a specific token excluded (cached)."""
-    return [t for t in get_available_tokens(tokenizer) if t != exclude_token_id]
-
-
-def gen_prompt(tokenizer, token_num: int) -> str:
+def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
     all_available_tokens = get_available_tokens(tokenizer)
     selected_tokens = random.choices(all_available_tokens, k=token_num)
     return tokenizer.decode(selected_tokens)
 
 
-def gen_mm_prompt(tokenizer, image_pad_id, token_num: int) -> str:
-    """Generate a random prompt of ``token_num`` tokens, excluding ``image_pad_id``."""
-    if image_pad_id is not None:
-        tokens = _get_available_tokens_excluding(tokenizer, image_pad_id)
-    else:
-        tokens = get_available_tokens(tokenizer)
-    return tokenizer.decode(random.choices(tokens, k=token_num))
+def gen_mm_prompt(tokenizer, image_pad_id, token_num):
+    """Generate a random prompt of specified token length using tokenizer vocabulary."""
+    all_available_tokens = list(tokenizer.get_vocab().values())
+    if image_pad_id:
+        all_available_tokens.remove(image_pad_id)
+    selected_tokens = random.choices(all_available_tokens, k=token_num)
+    return tokenizer.decode(selected_tokens)
