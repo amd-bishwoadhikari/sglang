@@ -213,15 +213,21 @@ def create_mm_data_row(
         # Some tokenizers do not support list content; fall back to a placeholder in the text
         prompt_str = f"<image>{text_prompt}"
 
-    # Total sequence length (text + vision + templates + overheads)
-    processed = processor(
-        text=[prompt_str],
-        images=images,
-        padding=False,
-        return_tensors="pt",
-    )
-    input_ids = processed["input_ids"][0]
-    prompt_len = input_ids.numel()
+    # Calculate total tokens (text + vision)
+    if type(processor).__name__ == "KimiK25Processor":
+        medias = [{"type": "image", "image": img} for img in images]
+        prompt_len = processor(
+            text=prompt_str,
+            medias=medias,
+            return_tensors="pt",
+        )["input_ids"].numel()
+    else:
+        prompt_len = processor(
+            text=[prompt_str],
+            images=images,
+            padding=False,
+            return_tensors="pt",
+        )["input_ids"].numel()
 
     # Text tokens after chat template (no images)
     try:
