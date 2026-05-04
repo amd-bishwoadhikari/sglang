@@ -253,19 +253,16 @@ def sample_image_requests(
         return img, image_data, image_bytes
 
     dataset: List[DatasetRow] = []
-    detail_stats: List[dict] = []
     total_image_bytes = 0
     for i in range(num_requests):
         # Get the number of images for this request
         request_image_count = int(image_counts[i])
 
-        raw_text_token_count = int(input_lens[i])
-
         # Generate text prompt
         text_prompt = gen_mm_prompt(
             processor.tokenizer,
             processor.image_token_id if hasattr(processor, "image_token_id") else None,
-            raw_text_token_count,
+            int(input_lens[i]),
         )
 
         # Generate image list
@@ -283,18 +280,10 @@ def sample_image_requests(
             backend,
         )
         dataset.append(data_row)
-        detail_stats.append(
-            {
-                "input_len": raw_text_token_count,
-                "text_prompt_len": data_row.text_prompt_len,
-                "text_prompt_overhead": data_row.text_prompt_len - raw_text_token_count,
-                "vision_prompt_len": data_row.vision_prompt_len,
-            }
-        )
 
     # Print statistics
-    print(f"#Total Input tokens: {np.sum([x.prompt_len for x in dataset])}")
-    print(f"#Total Output tokens: {np.sum([x.output_len for x in dataset])}")
+    print(f"#Input tokens: {np.sum([x.prompt_len for x in dataset])}")
+    print(f"#Output tokens: {np.sum([x.output_len for x in dataset])}")
     print(f"#Total images: {total_images}")
 
     if random_image_count:
@@ -304,16 +293,18 @@ def sample_image_requests(
     else:
         print(f"#Images per request: {image_count} (fixed)")
 
-    # Detailed token breakdown
+    # Detailed token breakdown (derived from dataset + input_lens)
+    text_prompt_lens = np.array([r.text_prompt_len for r in dataset])
+    vision_prompt_lens = np.array([r.vision_prompt_len for r in dataset])
+    text_prompt_overheads = text_prompt_lens - input_lens
     stat_fields = [
-        ("Raw text prompt tokens (w/o overhead)", "input_len"),
-        ("Text prompt tokens (w/ chat template)", "text_prompt_len"),
-        ("Text prompt overhead", "text_prompt_overhead"),
-        ("Vision tokens", "vision_prompt_len"),
+        ("Raw text prompt tokens (without overhead)", input_lens),
+        ("Text prompt tokens (with chat template)", text_prompt_lens),
+        ("Text prompt overhead", text_prompt_overheads),
+        ("Vision tokens", vision_prompt_lens),
     ]
-    print("\n--- Token Breakdown (per request avg / total) ---")
-    for label, key in stat_fields:
-        vals = [s[key] for s in detail_stats]
+    print("\n=== Token Breakdown (per request avg / total) ===")
+    for label, vals in stat_fields:
         print(f"  {label}: avg={np.mean(vals):.1f}, total={np.sum(vals)}")
 
     print(
