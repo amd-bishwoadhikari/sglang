@@ -93,105 +93,9 @@ def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
     )
 
 
-_SUPPORTED_BACKENDS = ("sglang", "sglang-native", "sglang-oai-chat")
-
-
-def resolve_prompt_mode(backend: str) -> bool:
-    if backend not in _SUPPORTED_BACKENDS:
-        raise ValueError(
-            f"Image dataset only supports backends: {list(_SUPPORTED_BACKENDS)}, "
-            f"got '{backend}'."
-        )
-    # sglang-oai-chat: server's chat handler applies chat template, so send raw text.
-    # sglang/sglang-native: /generate does not apply chat template, so send prompt_str
-    # which contains image placeholder tokens needed by the multimodal processor.
-    return backend == "sglang-oai-chat"
-
-
-def _print_image_stats(
-    dataset,
-    total_images,
-    image_counts,
-    random_image_count,
-    image_count,
-    image_content,
-    image_format,
-    total_image_bytes,
-):
-    """Print aggregated image benchmark dataset token statistics.
-
-    Metrics are read from either DatasetRow fields or from
-    ``extra_request_body["image_metrics"]`` for backward compatibility with
-    slimmer DatasetRow schemas.
-    """
-
-    def _get_metric(row: DatasetRow, attr: str) -> int:
-        """Fetch one metric from row fields or image_metrics payload."""
-        val = getattr(row, attr, None)
-        if val is not None:
-            return int(val)
-        extra = getattr(row, "extra_request_body", None) or {}
-        return int(extra.get("image_metrics", {}).get(attr, 0))
-
-    _ROWS = [
-        ("Raw text prompt tokens (w/o overhead)", "input_len"),
-        ("Text prompt tokens (w overhead)", "text_prompt_len"),
-        ("Text prompt overhead", "text_prompt_overhead"),
-        ("Raw vision prompt tokens (w/o overhead)", "raw_vision_prompt_len"),
-        ("Vision prompt tokens (w overhead)", "vision_prompt_len"),
-        ("Vision overhead", "vision_prompt_overhead"),
-        ("Total input tokens", "prompt_len"),
-        ("Total output tokens", "output_len"),
-    ]
-    fmt = []
-    for lb, attr in _ROWS:
-        a = np.array([_get_metric(r, attr) for r in dataset])
-        fmt.append(
-            (
-                lb,
-                f"{int(a.sum()):,}",
-                f"{a.mean():,.1f}",
-                f"{int(a.min()):,}",
-                f"{int(a.max()):,}",
-            )
-        )
-    w = [max(len(r[i]) for r in fmt) for i in range(5)]
-
-    print("\n===== Image Dataset Statistics =====")
-    print(f"  Number of requests: {len(dataset)}")
-    print(f"  Total images:       {total_images}")
-    if random_image_count:
-        print(
-            f"  Images per request: min={np.min(image_counts)}, "
-            f"max={np.max(image_counts)}, mean={np.mean(image_counts):.2f}"
-        )
-    else:
-        print(f"  Images per request: {image_count} (fixed)")
-    print()
-    for lb, s, m, mn, mx in fmt:
-        print(
-            f"  {lb:<{w[0]}s}  sum={s:>{w[1]}}  mean={m:>{w[2]}}"
-            f"  min={mn:>{w[3]}}  max={mx:>{w[4]}}"
-        )
-    print(
-        f"\n  Image payload: {image_content} {image_format}, "
-        f"avg {total_image_bytes // max(len(dataset), 1):,} bytes/request"
-    )
-    print("====================================\n")
-
-
 def create_mm_data_row(
-    text_prompt: str,
-    images: List[Image.Image],
-    images_base64: List[str],
-    output_len: int,
-    processor: AutoProcessor,
-    backend: str,
-    input_len: int = None,
-) -> DatasetRow:
-    """Create a multimodal data row for an image dataset."""
-
-    use_raw_prompt = resolve_prompt_mode(backend)
+    text_prompt, images: list, images_base64, output_len, processor, backend
+):
     try:
         if type(processor).__name__ == "Phi4MMProcessor":
             # <|endoftext10|> is the image token used in the phi-4-multimodal model.
@@ -229,15 +133,16 @@ def create_mm_data_row(
             return_tensors="pt",
         )["input_ids"].numel()
 
-    # Text tokens after chat template (no images)
+    # Calculate text-only tokens
     try:
-        text_only_str = processor.apply_chat_template(
+        # Create text-only version of the prompt
+        text_only_prompt = processor.apply_chat_template(
             [{"role": "user", "content": text_prompt}],
             add_generation_prompt=True,
             tokenize=False,
         )
         text_prompt_len = processor(
-            text=[text_only_str],
+            text=[text_only_prompt],
             padding=False,
             return_tensors="pt",
         )["input_ids"].numel()
@@ -248,23 +153,20 @@ def create_mm_data_row(
         )
         text_prompt_len = len(tokenizer_to_use.encode(text_prompt))
 
-    # Raw vision tokens (image pad tokens only)
-    if hasattr(processor, "image_token_id") and processor.image_token_id is not None:
-        raw_vision_prompt_len = (input_ids == processor.image_token_id).sum().item()
-    else:
-        raw_vision_prompt_len = 0
+    # Vision tokens = total tokens - text tokens
     vision_prompt_len = prompt_len - text_prompt_len
 
-    # If input_len is not provided, use text_prompt_len as input_len
-    if input_len is None:
-        input_len = text_prompt_len
-    # Calculate metrics for the image dataset
-    image_metrics = {
-        "input_len": input_len,
-        "raw_vision_prompt_len": raw_vision_prompt_len,
-        "text_prompt_overhead": max(prompt_len - input_len - vision_prompt_len, 0),
-        "vision_prompt_overhead": max(vision_prompt_len - raw_vision_prompt_len, 0),
-    }
+    supported_backends = ["sglang", "sglang-native", "sglang-oai-chat"]
+    if backend not in supported_backends:
+        raise ValueError(
+            f"Image dataset only supports backends: {supported_backends}, "
+            f"got '{backend}'."
+        )
+
+    # sglang-oai-chat: server's chat handler applies chat template, so send raw text.
+    # sglang/sglang-native: /generate does not apply chat template, so send prompt_str
+    #         which contains image placeholder tokens needed by the multimodal processor.
+    use_raw_prompt = backend == "sglang-oai-chat"
 
     return DatasetRow(
         prompt=text_prompt if use_raw_prompt else prompt_str,
@@ -273,7 +175,6 @@ def create_mm_data_row(
         text_prompt_len=text_prompt_len,
         vision_prompt_len=vision_prompt_len,
         image_data=images_base64,
-        extra_request_body={"image_metrics": image_metrics},
     )
 
 
@@ -297,7 +198,7 @@ def sample_image_requests(
     - Supported resolutions: 4k (3840x2160), 1080p (1920x1080), 720p (1280x720), 360p (640x360),
       or custom 'heightxwidth' (e.g., 1080x1920).
     - Text lengths follow the 'random' dataset sampling rule. ``prompt_len``
-      is the full multimodal sequence length (text + vision + templates + overheads).
+      only counts text tokens and excludes image data.
     """
 
     # Parse resolution (supports presets and 'heightxwidth')
@@ -352,17 +253,19 @@ def sample_image_requests(
         return img, image_data, image_bytes
 
     dataset: List[DatasetRow] = []
+    detail_stats: List[dict] = []
     total_image_bytes = 0
     for i in range(num_requests):
         # Get the number of images for this request
         request_image_count = int(image_counts[i])
 
+        raw_text_token_count = int(input_lens[i])
+
         # Generate text prompt
-        target_len = int(input_lens[i])
         text_prompt = gen_mm_prompt(
             processor.tokenizer,
-            getattr(processor, "image_token_id", None),
-            target_len,
+            processor.image_token_id if hasattr(processor, "image_token_id") else None,
+            raw_text_token_count,
         )
 
         # Generate image list
@@ -378,19 +281,42 @@ def sample_image_requests(
             int(output_lens[i]),
             processor,
             backend,
-            input_len=target_len,
         )
         dataset.append(data_row)
+        detail_stats.append(
+            {
+                "input_len": raw_text_token_count,
+                "text_prompt_len": data_row.text_prompt_len,
+                "text_prompt_overhead": data_row.text_prompt_len - raw_text_token_count,
+                "vision_prompt_len": data_row.vision_prompt_len,
+            }
+        )
 
     # Print statistics
-    _print_image_stats(
-        dataset,
-        total_images,
-        image_counts,
-        random_image_count,
-        image_count,
-        image_content,
-        image_format,
-        total_image_bytes,
+    print(f"#Total Input tokens: {np.sum([x.prompt_len for x in dataset])}")
+    print(f"#Total Output tokens: {np.sum([x.output_len for x in dataset])}")
+    print(f"#Total images: {total_images}")
+
+    if random_image_count:
+        print(
+            f"#Images per request: min={np.min(image_counts)}, max={np.max(image_counts)}, mean={np.mean(image_counts):.2f}"
+        )
+    else:
+        print(f"#Images per request: {image_count} (fixed)")
+
+    # Detailed token breakdown
+    stat_fields = [
+        ("Raw text prompt tokens (w/o overhead)", "input_len"),
+        ("Text prompt tokens (w/ chat template)", "text_prompt_len"),
+        ("Text prompt overhead", "text_prompt_overhead"),
+        ("Vision tokens", "vision_prompt_len"),
+    ]
+    print("\n--- Token Breakdown (per request avg / total) ---")
+    for label, key in stat_fields:
+        vals = [s[key] for s in detail_stats]
+        print(f"  {label}: avg={np.mean(vals):.1f}, total={np.sum(vals)}")
+
+    print(
+        f"\nCreated {len(dataset)} {image_content} {image_format} images with average {total_image_bytes // num_requests} bytes per request"
     )
     return dataset
